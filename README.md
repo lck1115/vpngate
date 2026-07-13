@@ -36,6 +36,18 @@ VPNGate API
 docker compose up -d --build
 ```
 
+如果使用 GitHub Actions 构建镜像，推送到 GitHub 后镜像会发布到：
+
+```text
+ghcr.io/<owner>/<repo>:latest
+```
+
+之后可以把 `docker-compose.yml` 里的 `build: .` 改为：
+
+```yaml
+image: ghcr.io/<owner>/<repo>:latest
+```
+
 查看日志：
 
 ```bash
