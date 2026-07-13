@@ -341,9 +341,21 @@ def pid_alive(pid_file: Path) -> bool:
     try:
         pid = int(pid_file.read_text().strip())
         os.kill(pid, 0)
+        stat_path = Path(f"/proc/{pid}/stat")
+        if stat_path.exists():
+            state = stat_path.read_text(encoding="utf-8", errors="replace").split()[2]
+            if state == "Z":
+                return False
         return True
     except Exception:
         return False
+
+
+def tail_file(path: Path, lines: int = 40) -> str:
+    if not path.exists():
+        return ""
+    content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(content[-lines:])
 
 
 def stop_pid(pid_file: Path, name: str, timeout: int = 10) -> None:
@@ -464,11 +476,21 @@ def start_socks_server() -> None:
     SOCKS_PID.write_text(str(proc.pid), encoding="utf-8")
     end = time.time() + 10
     while time.time() < end:
-        if pid_alive(SOCKS_PID):
+        if proc.poll() is not None:
+            SOCKS_PID.unlink(missing_ok=True)
+            details = tail_file(SOCKS_LOG)
+            raise RuntimeError(f"socks-server exited early with code {proc.returncode}\n{details}")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                pass
             log(f"socks-server is listening on 0.0.0.0:{port}")
             return
+        except OSError:
+            time.sleep(0.5)
+            continue
         time.sleep(0.5)
-    raise RuntimeError("socks-server did not start")
+    details = tail_file(SOCKS_LOG)
+    raise RuntimeError(f"socks-server did not become reachable on 127.0.0.1:{port}\n{details}")
 
 
 def curl_through_socks() -> str:
