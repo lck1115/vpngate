@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import csv
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Iterable
+
+
+API_URL = "https://www.vpngate.net/api/iphone/"
+DATA_DIR = Path("/data")
+RUN_DIR = Path("/run/vpngate")
+CURRENT_JSON = DATA_DIR / "current.json"
+PREVIOUS_JSON = DATA_DIR / "previous.json"
+NEXT_JSON = DATA_DIR / "next.json"
+CURRENT_OVPN = DATA_DIR / "current.ovpn"
+PREVIOUS_OVPN = DATA_DIR / "previous.ovpn"
+NEXT_OVPN = DATA_DIR / "next.ovpn"
+AUTH_FILE = DATA_DIR / "auth.txt"
+CACHE_FILE = DATA_DIR / "vpngate-cache.csv"
+LOG_FILE = DATA_DIR / "vpngate-socks5.log"
+OPENVPN_LOG = DATA_DIR / "openvpn.log"
+DANTED_LOG = DATA_DIR / "danted.log"
+LOCK_FILE = RUN_DIR / "lock"
+OPENVPN_PID = RUN_DIR / "openvpn.pid"
+DANTED_PID = RUN_DIR / "danted.pid"
+DANTED_CONF = RUN_DIR / "danted.conf"
+RUNTIME_OVPN = RUN_DIR / "current.runtime.ovpn"
+
+
+@dataclass
+class Candidate:
+    hostname: str
+    ip: str
+    score_raw: int
+    ping: int
+    speed: int
+    country_long: str
+    country_short: str
+    sessions: int
+    uptime: int
+    total_users: int
+    total_traffic: int
+    log_type: str
+    operator: str
+    message: str
+    ovpn_b64: str
+    proto: str
+    remote_host: str
+    remote_port: int
+    score: float = 0.0
+
+    @property
+    def speed_mbps(self) -> float:
+        return self.speed / 1_000_000.0
+
+    @property
+    def uptime_days(self) -> float:
+        return self.uptime / 86400.0
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
+def log(message: str) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S%z")
+    line = f"{stamp} {message}"
+    print(line, flush=True)
+    with LOG_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def die(message: str, code: int = 1) -> None:
+    log(f"ERROR: {message}")
+    raise SystemExit(code)
+
+
+def ensure_dirs() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class FileLock:
+    def __enter__(self):
+        ensure_dirs()
+        self.fh = LOCK_FILE.open("w")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+def run_cmd(args: list[str], check: bool = True, capture: bool = False, timeout: int | None = None) -> subprocess.CompletedProcess:
+    log(f"CMD: {' '.join(args)}")
+    return subprocess.run(args, check=check, text=True, capture_output=capture, timeout=timeout)
+
+
+def fetch_api() -> str:
+    timeout = env_int("CONNECT_TIMEOUT", 60)
+    log(f"Fetching VPNGate API: {API_URL}")
+    req = urllib.request.Request(API_URL, headers={"User-Agent": "vpngate-socks5/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8", errors="replace")
+    CACHE_FILE.write_text(body, encoding="utf-8")
+    return body
+
+
+def parse_int(value: str, default: int = 0) -> int:
+    try:
+        return int(float((value or "").strip()))
+    except ValueError:
+        return default
+
+
+def parse_remote(ovpn: str) -> tuple[str, int, str] | None:
+    proto = "udp"
+    remote_host = ""
+    remote_port = 0
+
+    for raw in ovpn.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith(";"):
+            continue
+        parts = line.split()
+        if not parts:
+            continue
+        key = parts[0].lower()
+        if key == "proto" and len(parts) >= 2:
+            proto = parts[1].lower().replace("-client", "")
+        if key == "remote" and len(parts) >= 3 and not remote_host:
+            remote_host = parts[1]
+            remote_port = parse_int(parts[2])
+
+    if not remote_host or remote_port <= 0:
+        return None
+    if "tcp" in proto:
+        proto = "tcp"
+    elif "udp" in proto:
+        proto = "udp"
+    return remote_host, remote_port, proto
+
+
+def decode_ovpn(ovpn_b64: str) -> str | None:
+    try:
+        return base64.b64decode(ovpn_b64, validate=False).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+
+def csv_rows(text: str) -> Iterable[dict[str, str]]:
+    lines = text.splitlines()
+    header_index = None
+    for i, line in enumerate(lines):
+        if line.startswith("#HostName,"):
+            header_index = i
+            break
+    if header_index is None:
+        return []
+
+    csv_lines = []
+    for line in lines[header_index:]:
+        if line.startswith("*"):
+            break
+        if line.startswith("#HostName,"):
+            line = line[1:]
+        if line.startswith("#"):
+            continue
+        if line.strip():
+            csv_lines.append(line)
+
+    return csv.DictReader(csv_lines)
+
+
+def load_candidates(country: str = "", use_cache: bool = False) -> list[Candidate]:
+    text = CACHE_FILE.read_text(encoding="utf-8") if use_cache and CACHE_FILE.exists() else fetch_api()
+    country = country.strip().upper()
+    min_speed = env_int("MIN_SPEED", 0)
+    max_ping = env_int("MAX_PING", 9999)
+
+    candidates: list[Candidate] = []
+    for row in csv_rows(text):
+        if country and (row.get("CountryShort") or "").upper() != country:
+            continue
+
+        ovpn_b64 = (row.get("OpenVPN_ConfigData_Base64") or "").strip()
+        if not ovpn_b64:
+            continue
+        ovpn = decode_ovpn(ovpn_b64)
+        if not ovpn:
+            continue
+        remote = parse_remote(ovpn)
+        if not remote:
+            continue
+        remote_host, remote_port, proto = remote
+
+        ping = parse_int(row.get("Ping", "0"))
+        speed = parse_int(row.get("Speed", "0"))
+        sessions = parse_int(row.get("NumVpnSessions", "0"))
+        uptime = parse_int(row.get("Uptime", "0"))
+
+        if ping <= 0 and speed <= 0:
+            continue
+        if speed < min_speed:
+            continue
+        if ping > max_ping:
+            continue
+
+        candidates.append(Candidate(
+            hostname=row.get("HostName", ""),
+            ip=row.get("IP", ""),
+            score_raw=parse_int(row.get("Score", "0")),
+            ping=ping,
+            speed=speed,
+            country_long=row.get("CountryLong", ""),
+            country_short=(row.get("CountryShort", "") or "").upper(),
+            sessions=sessions,
+            uptime=uptime,
+            total_users=parse_int(row.get("TotalUsers", "0")),
+            total_traffic=parse_int(row.get("TotalTraffic", "0")),
+            log_type=row.get("LogType", ""),
+            operator=row.get("Operator", ""),
+            message=row.get("Message", ""),
+            ovpn_b64=ovpn_b64,
+            proto=proto,
+            remote_host=remote_host,
+            remote_port=remote_port,
+        ))
+
+    if env_bool("PREFER_TCP", True):
+        tcp_candidates = [c for c in candidates if c.proto == "tcp"]
+        if tcp_candidates:
+            candidates = tcp_candidates
+
+    score_candidates(candidates)
+    return sorted(candidates, key=lambda c: c.score, reverse=True)
+
+
+def normalize(value: float, values: list[float], inverse: bool = False) -> float:
+    if not values:
+        return 0.0
+    lo = min(values)
+    hi = max(values)
+    if hi == lo:
+        base = 1.0
+    else:
+        base = (value - lo) / (hi - lo)
+    return 1.0 - base if inverse else base
+
+
+def score_candidates(candidates: list[Candidate]) -> None:
+    speeds = [float(c.speed) for c in candidates]
+    pings = [float(c.ping) for c in candidates]
+    sessions = [float(c.sessions) for c in candidates]
+    uptimes = [float(c.uptime) for c in candidates]
+    for c in candidates:
+        c.score = round(100.0 * (
+            0.45 * normalize(c.speed, speeds) +
+            0.25 * normalize(c.ping, pings, inverse=True) +
+            0.20 * normalize(c.sessions, sessions, inverse=True) +
+            0.10 * normalize(c.uptime, uptimes)
+        ), 2)
+
+
+def candidate_to_json(candidate: Candidate) -> dict:
+    data = asdict(candidate)
+    data.pop("ovpn_b64", None)
+    return data
+
+
+def patch_ovpn(ovpn: str) -> str:
+    lines = []
+    has_auth_nocache = False
+    has_verb = False
+    for raw in ovpn.splitlines():
+        line = raw.strip()
+        if line.lower().startswith("auth-user-pass"):
+            lines.append(f"auth-user-pass {AUTH_FILE}")
+            continue
+        if line.lower() == "auth-nocache":
+            has_auth_nocache = True
+        if line.lower().startswith("verb "):
+            has_verb = True
+        lines.append(raw)
+
+    if f"auth-user-pass {AUTH_FILE}" in lines:
+        AUTH_FILE.write_text("vpn\nvpn\n", encoding="utf-8")
+        AUTH_FILE.chmod(0o600)
+    if not has_auth_nocache:
+        lines.append("auth-nocache")
+    if not has_verb:
+        lines.append("verb 3")
+    lines.append("connect-retry-max 2")
+    lines.append("resolv-retry 5")
+    return "\n".join(lines) + "\n"
+
+
+def write_candidate(candidate: Candidate, ovpn_path: Path, json_path: Path) -> None:
+    ovpn = decode_ovpn(candidate.ovpn_b64)
+    if not ovpn:
+        raise RuntimeError("failed to decode OpenVPN config")
+    ovpn_path.write_text(patch_ovpn(ovpn), encoding="utf-8")
+    json_path.write_text(json.dumps(candidate_to_json(candidate), indent=2, sort_keys=True), encoding="utf-8")
+
+
+def read_json(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def pid_alive(pid_file: Path) -> bool:
+    if not pid_file.exists():
+        return False
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def stop_pid(pid_file: Path, name: str, timeout: int = 10) -> None:
+    if not pid_file.exists():
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+    except Exception:
+        pid_file.unlink(missing_ok=True)
+        return
+    log(f"Stopping {name} pid={pid}")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pid_file.unlink(missing_ok=True)
+        return
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            os.kill(pid, 0)
+            time.sleep(0.5)
+        except ProcessLookupError:
+            pid_file.unlink(missing_ok=True)
+            return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    pid_file.unlink(missing_ok=True)
+
+
+def stop_services() -> None:
+    stop_pid(DANTED_PID, "danted")
+    stop_pid(OPENVPN_PID, "openvpn")
+
+
+def reset_firewall_open() -> None:
+    for table in ("filter",):
+        for chain in ("OUTPUT",):
+            subprocess.run(["iptables", "-t", table, "-F", chain], check=False)
+    subprocess.run(["iptables", "-P", "OUTPUT", "ACCEPT"], check=False)
+
+
+def resolve_host(host: str) -> str:
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        return socket.gethostbyname(host)
+
+
+def configure_kill_switch(remote_host: str, remote_port: int, proto: str) -> str:
+    remote_ip = resolve_host(remote_host)
+    proto = "tcp" if proto == "tcp" else "udp"
+    log(f"Configuring kill-switch remote={remote_ip}:{remote_port}/{proto}")
+    reset_firewall_open()
+    run_cmd(["iptables", "-P", "OUTPUT", "DROP"], check=True)
+    run_cmd(["iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"], check=True)
+    run_cmd(["iptables", "-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"], check=True)
+    run_cmd(["iptables", "-A", "OUTPUT", "-o", "tun0", "-j", "ACCEPT"], check=True)
+    run_cmd(["iptables", "-A", "OUTPUT", "-d", remote_ip, "-p", proto, "--dport", str(remote_port), "-j", "ACCEPT"], check=True)
+    return remote_ip
+
+
+def materialize_runtime_ovpn(ovpn_path: Path, remote_ip: str, remote_port: int) -> Path:
+    rendered = []
+    replaced = False
+    for raw in ovpn_path.read_text(encoding="utf-8").splitlines():
+        parts = raw.strip().split()
+        if not replaced and len(parts) >= 3 and parts[0].lower() == "remote":
+            rendered.append(f"remote {remote_ip} {remote_port}")
+            replaced = True
+        else:
+            rendered.append(raw)
+    RUNTIME_OVPN.write_text("\n".join(rendered) + "\n", encoding="utf-8")
+    return RUNTIME_OVPN
+
+
+def wait_for_tun(timeout: int) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        if Path("/sys/class/net/tun0").exists():
+            return True
+        time.sleep(1)
+    return False
+
+
+def write_danted_conf(port: int) -> None:
+    DANTED_CONF.write_text(f"""logoutput: {DANTED_LOG}
+internal: 0.0.0.0 port = {port}
+external: tun0
+clientmethod: none
+socksmethod: none
+user.privileged: root
+user.notprivileged: nobody
+user.libwrap: nobody
+pidfile: {DANTED_PID}
+
+client pass {{
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: error
+}}
+
+socks pass {{
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    command: bind connect udpassociate
+    log: error
+}}
+""", encoding="utf-8")
+
+
+def start_openvpn(ovpn_path: Path, meta: dict) -> None:
+    timeout = env_int("CONNECT_TIMEOUT", 60)
+    remote_ip = configure_kill_switch(meta["remote_host"], int(meta["remote_port"]), meta["proto"])
+    runtime_ovpn = materialize_runtime_ovpn(ovpn_path, remote_ip, int(meta["remote_port"]))
+    OPENVPN_PID.unlink(missing_ok=True)
+    OPENVPN_LOG.touch(exist_ok=True)
+    cmd = [
+        "openvpn",
+        "--config", str(runtime_ovpn),
+        "--writepid", str(OPENVPN_PID),
+        "--log-append", str(OPENVPN_LOG),
+        "--daemon",
+    ]
+    run_cmd(cmd)
+    if not wait_for_tun(timeout):
+        raise RuntimeError(f"tun0 did not appear within {timeout}s")
+    log("OpenVPN connected and tun0 is available")
+
+
+def start_danted() -> None:
+    port = env_int("SOCKS_PORT", 1080)
+    write_danted_conf(port)
+    DANTED_PID.unlink(missing_ok=True)
+    run_cmd(["danted", "-f", str(DANTED_CONF), "-D"])
+    end = time.time() + 10
+    while time.time() < end:
+        if pid_alive(DANTED_PID):
+            log(f"danted is listening on 0.0.0.0:{port}")
+            return
+        time.sleep(0.5)
+    raise RuntimeError("danted did not start")
+
+
+def curl_through_socks() -> str:
+    port = env_int("SOCKS_PORT", 1080)
+    url = os.getenv("HEALTHCHECK_URL", "https://api.ipify.org")
+    proc = subprocess.run(
+        ["curl", "--fail", "--silent", "--show-error", "--max-time", "20", "--socks5-hostname", f"127.0.0.1:{port}", url],
+        text=True,
+        capture_output=True,
+        timeout=25,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "curl health check failed")
+    return proc.stdout.strip()
+
+
+def start_current(verify: bool = True) -> None:
+    meta = read_json(CURRENT_JSON)
+    if not meta or not CURRENT_OVPN.exists():
+        raise RuntimeError("current node is not configured")
+    stop_services()
+    start_openvpn(CURRENT_OVPN, meta)
+    start_danted()
+    if verify:
+        ip = curl_through_socks()
+        log(f"SOCKS5 health check OK, exit_ip={ip}")
+
+
+def select_best(country: str = "") -> Candidate:
+    candidates = load_candidates(country=country)
+    if not candidates:
+        raise RuntimeError(f"no usable VPNGate candidates found for country={country or 'ANY'}")
+    return candidates[0]
+
+
+def install_candidate(candidate: Candidate, verify: bool = True) -> None:
+    log(f"Installing node {candidate.country_short} {candidate.ip} score={candidate.score} proto={candidate.proto}")
+    if CURRENT_JSON.exists():
+        shutil.copy2(CURRENT_JSON, PREVIOUS_JSON)
+    if CURRENT_OVPN.exists():
+        shutil.copy2(CURRENT_OVPN, PREVIOUS_OVPN)
+
+    write_candidate(candidate, NEXT_OVPN, NEXT_JSON)
+    shutil.move(str(NEXT_JSON), str(CURRENT_JSON))
+    shutil.move(str(NEXT_OVPN), str(CURRENT_OVPN))
+    start_current(verify=verify)
+
+
+def rollback() -> None:
+    if not PREVIOUS_JSON.exists() or not PREVIOUS_OVPN.exists():
+        raise RuntimeError("no previous node available for rollback")
+    log("Rolling back to previous node")
+    shutil.copy2(PREVIOUS_JSON, CURRENT_JSON)
+    shutil.copy2(PREVIOUS_OVPN, CURRENT_OVPN)
+    start_current(verify=True)
+
+
+def cmd_run(_: argparse.Namespace) -> None:
+    ensure_dirs()
+    with FileLock():
+        reset_firewall_open()
+        if CURRENT_JSON.exists() and CURRENT_OVPN.exists():
+            try:
+                log("Starting existing current node")
+                start_current(verify=True)
+            except Exception as exc:
+                log(f"Existing current node failed: {exc}; selecting a new node")
+                reset_firewall_open()
+                country = os.getenv("DEFAULT_COUNTRY", "").strip().upper()
+                install_candidate(select_best(country), verify=True)
+        else:
+            country = os.getenv("DEFAULT_COUNTRY", "").strip().upper()
+            log(f"No current node found; selecting best node country={country or 'ANY'}")
+            install_candidate(select_best(country), verify=True)
+
+    log("vpngate-socks5 is ready")
+    while True:
+        time.sleep(30)
+        if not pid_alive(OPENVPN_PID):
+            die("openvpn process exited")
+        if not pid_alive(DANTED_PID):
+            die("danted process exited")
+
+
+def print_candidates(candidates: list[Candidate], limit: int) -> None:
+    print(f"{'No':>2}  {'Country':<7} {'IP':<15} {'Ping':>6} {'SpeedMbps':>10} {'Sessions':>8} {'UptimeDays':>10} {'Proto':>5} {'Score':>7}")
+    for i, c in enumerate(candidates[:limit], start=1):
+        print(
+            f"{i:>2}  {c.country_short:<7} {c.ip:<15} {c.ping:>6} "
+            f"{c.speed_mbps:>10.1f} {c.sessions:>8} {c.uptime_days:>10.1f} "
+            f"{c.proto:>5} {c.score:>7.2f}"
+        )
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    candidates = load_candidates(country=args.country or "")
+    if not candidates:
+        die(f"no candidates found for country={args.country or 'ANY'}")
+    print_candidates(candidates, args.limit)
+
+
+def cmd_status(_: argparse.Namespace) -> None:
+    meta = read_json(CURRENT_JSON)
+    if not meta:
+        die("no current node configured", code=2)
+    print(json.dumps(meta, indent=2, sort_keys=True))
+    print(f"openvpn_alive={pid_alive(OPENVPN_PID)}")
+    print(f"danted_alive={pid_alive(DANTED_PID)}")
+    try:
+        print(f"exit_ip={curl_through_socks()}")
+    except Exception as exc:
+        print(f"health_error={exc}")
+
+
+def choose_interactive(candidates: list[Candidate], limit: int) -> Candidate:
+    print_candidates(candidates, limit)
+    while True:
+        raw = input("Select node number: ").strip()
+        if not re.fullmatch(r"\d+", raw):
+            print("Please enter a number.")
+            continue
+        index = int(raw)
+        if 1 <= index <= min(limit, len(candidates)):
+            return candidates[index - 1]
+        print(f"Please enter a number between 1 and {min(limit, len(candidates))}.")
+
+
+def switch_to_candidate(candidate: Candidate) -> None:
+    with FileLock():
+        reset_firewall_open()
+        try:
+            install_candidate(candidate, verify=True)
+        except Exception as exc:
+            log(f"Switch failed: {exc}")
+            reset_firewall_open()
+            if env_bool("SWITCH_ROLLBACK", True):
+                try:
+                    rollback()
+                    return
+                except Exception as rollback_exc:
+                    log(f"Rollback failed: {rollback_exc}")
+            raise
+
+
+def cmd_switch(args: argparse.Namespace) -> None:
+    limit = args.limit
+    candidates = load_candidates(country=args.country or "")
+    if not candidates:
+        die(f"no candidates found for country={args.country or 'ANY'}")
+    print(f"Top {min(limit, len(candidates))} {args.country or 'ANY'} nodes:")
+    candidate = choose_interactive(candidates, limit)
+    switch_to_candidate(candidate)
+    print("Switch completed.")
+
+
+def cmd_auto(args: argparse.Namespace) -> None:
+    country = args.country or os.getenv("DEFAULT_COUNTRY", "").strip().upper()
+    candidate = select_best(country)
+    switch_to_candidate(candidate)
+    print(f"Auto selected {candidate.country_short} {candidate.ip} score={candidate.score}")
+
+
+def cmd_health(_: argparse.Namespace) -> None:
+    if not pid_alive(OPENVPN_PID):
+        die("openvpn is not running", code=1)
+    if not pid_alive(DANTED_PID):
+        die("danted is not running", code=1)
+    try:
+        ip = curl_through_socks()
+        print(ip)
+    except Exception as exc:
+        die(f"health check failed: {exc}", code=1)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="VPNGate OpenVPN to local SOCKS5 manager")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("run", help="start and monitor the VPNGate SOCKS5 service").set_defaults(func=cmd_run)
+    sub.add_parser("status", help="show current node and process status").set_defaults(func=cmd_status)
+    sub.add_parser("health", help="check OpenVPN, danted, and SOCKS5 exit").set_defaults(func=cmd_health)
+
+    list_p = sub.add_parser("list", help="list VPNGate candidates")
+    list_p.add_argument("--country", default="", help="CountryShort filter, for example JP, US, KR")
+    list_p.add_argument("--limit", type=int, default=env_int("LIST_LIMIT", 10))
+    list_p.set_defaults(func=cmd_list)
+
+    switch_p = sub.add_parser("switch", help="interactively switch to a VPNGate node")
+    switch_p.add_argument("--country", default="", help="CountryShort filter, for example JP, US, KR")
+    switch_p.add_argument("--limit", type=int, default=env_int("LIST_LIMIT", 10))
+    switch_p.set_defaults(func=cmd_switch)
+
+    auto_p = sub.add_parser("auto", help="switch to the current best VPNGate node")
+    auto_p.add_argument("--country", default="", help="CountryShort filter, for example JP, US, KR")
+    auto_p.set_defaults(func=cmd_auto)
+
+    return parser
+
+
+def main() -> None:
+    ensure_dirs()
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as exc:
+        die(str(exc))
+
+
+if __name__ == "__main__":
+    main()

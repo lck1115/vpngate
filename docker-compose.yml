@@ -1,0 +1,29 @@
+services:
+  vpngate-socks5:
+    build: .
+    container_name: vpngate-socks5
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "127.0.0.1:${SOCKS_PORT:-1080}:1080"
+    environment:
+      SOCKS_PORT: "1080"
+      DEFAULT_COUNTRY: ""
+      LIST_LIMIT: "10"
+      MIN_SPEED: "0"
+      MAX_PING: "9999"
+      PREFER_TCP: "true"
+      HEALTHCHECK_URL: "https://api.ipify.org"
+      CONNECT_TIMEOUT: "60"
+      SWITCH_ROLLBACK: "true"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "vpngate", "health"]
+      interval: 60s
+      timeout: 20s
+      retries: 2
+      start_period: 90s
