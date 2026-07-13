@@ -16,7 +16,7 @@ services:
       MAX_PING: "9999"
       PREFER_TCP: "true"
       HEALTHCHECK_URL: "https://api.ipify.org"
-      CONNECT_TIMEOUT: "60"
+      CONNECT_TIMEOUT: "10"
       SWITCH_ROLLBACK: "true"
     volumes:
       - ./data:/data

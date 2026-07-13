@@ -439,6 +439,8 @@ def wait_for_tun(timeout: int) -> bool:
     while time.time() < end:
         if Path("/sys/class/net/tun0").exists():
             return True
+        if OPENVPN_PID.exists() and not pid_alive(OPENVPN_PID):
+            raise RuntimeError(f"openvpn exited before tun0 appeared\n{tail_file(OPENVPN_LOG)}")
         time.sleep(1)
     return False
 
@@ -458,7 +460,7 @@ def start_openvpn(ovpn_path: Path, meta: dict) -> None:
     ]
     run_cmd(cmd)
     if not wait_for_tun(timeout):
-        raise RuntimeError(f"tun0 did not appear within {timeout}s")
+        raise RuntimeError(f"tun0 did not appear within {timeout}s\n{tail_file(OPENVPN_LOG)}")
     log("OpenVPN connected and tun0 is available")
 
 
@@ -526,6 +528,31 @@ def select_best(country: str = "") -> Candidate:
     return candidates[0]
 
 
+def install_best_available(country: str = "") -> Candidate:
+    limit = env_int("LIST_LIMIT", 10)
+    candidates = load_candidates(country=country)
+    if not candidates:
+        raise RuntimeError(f"no usable VPNGate candidates found for country={country or 'ANY'}")
+
+    last_error: Exception | None = None
+    for candidate in candidates[:limit]:
+        try:
+            log(
+                "Trying candidate "
+                f"{candidate.country_short} {candidate.ip} score={candidate.score} "
+                f"proto={candidate.proto} remote={candidate.remote_host}:{candidate.remote_port}"
+            )
+            install_candidate(candidate, verify=True)
+            return candidate
+        except Exception as exc:
+            last_error = exc
+            log(f"Candidate {candidate.country_short} {candidate.ip} failed: {exc}")
+            stop_services()
+            reset_firewall_open()
+
+    raise RuntimeError(f"all top {min(limit, len(candidates))} candidates failed: {last_error}")
+
+
 def install_candidate(candidate: Candidate, verify: bool = True) -> None:
     log(f"Installing node {candidate.country_short} {candidate.ip} score={candidate.score} proto={candidate.proto}")
     if CURRENT_JSON.exists():
@@ -560,11 +587,11 @@ def cmd_run(_: argparse.Namespace) -> None:
                 log(f"Existing current node failed: {exc}; selecting a new node")
                 reset_firewall_open()
                 country = os.getenv("DEFAULT_COUNTRY", "").strip().upper()
-                install_candidate(select_best(country), verify=True)
+                install_best_available(country)
         else:
             country = os.getenv("DEFAULT_COUNTRY", "").strip().upper()
             log(f"No current node found; selecting best node country={country or 'ANY'}")
-            install_candidate(select_best(country), verify=True)
+            install_best_available(country)
 
     log("vpngate-socks5 is ready")
     while True:
@@ -648,8 +675,9 @@ def cmd_switch(args: argparse.Namespace) -> None:
 
 def cmd_auto(args: argparse.Namespace) -> None:
     country = args.country or os.getenv("DEFAULT_COUNTRY", "").strip().upper()
-    candidate = select_best(country)
-    switch_to_candidate(candidate)
+    with FileLock():
+        reset_firewall_open()
+        candidate = install_best_available(country)
     print(f"Auto selected {candidate.country_short} {candidate.ip} score={candidate.score}")
 
 

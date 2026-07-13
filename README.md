@@ -136,7 +136,7 @@ environment:
   MAX_PING: "9999"
   PREFER_TCP: "true"
   HEALTHCHECK_URL: "https://api.ipify.org"
-  CONNECT_TIMEOUT: "60"
+  CONNECT_TIMEOUT: "10"
   SWITCH_ROLLBACK: "true"
 ```
 
@@ -149,7 +149,7 @@ environment:
 - `MAX_PING`：过滤高于该 ms 延迟的节点。
 - `PREFER_TCP`：优先选择 OpenVPN TCP 节点；如果没有 TCP 候选，会回退到全部候选。
 - `HEALTHCHECK_URL`：用于验证 SOCKS5 出口的 URL。
-- `CONNECT_TIMEOUT`：等待 OpenVPN/tun0 的秒数。
+- `CONNECT_TIMEOUT`：等待 OpenVPN/tun0 的秒数，默认 `10`，用于快速跳过不可用 VPNGate 节点。
 - `SWITCH_ROLLBACK`：切换失败时是否回滚到上一个节点。
 
 ## 评分规则
