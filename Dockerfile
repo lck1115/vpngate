@@ -6,7 +6,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
-        dante-server \
         iproute2 \
         iptables \
         openvpn \

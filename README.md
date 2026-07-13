@@ -16,7 +16,7 @@
 VPNGate API
   -> 自动选择 OpenVPN 节点
   -> Docker 容器内连接 VPNGate
-  -> 容器内启动 danted SOCKS5
+  -> 容器内启动内置 SOCKS5 server
   -> SOCKS5 出口强制走 tun0
   -> 宿主机通过 127.0.0.1:1080 使用该 SOCKS5
 ```
@@ -210,7 +210,7 @@ data/previous.ovpn
 data/vpngate-cache.csv
 data/vpngate-socks5.log
 data/openvpn.log
-data/danted.log
+data/socks5.log
 ```
 
 ## 注意事项

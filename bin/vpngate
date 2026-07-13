@@ -12,6 +12,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass, asdict
@@ -32,12 +33,12 @@ AUTH_FILE = DATA_DIR / "auth.txt"
 CACHE_FILE = DATA_DIR / "vpngate-cache.csv"
 LOG_FILE = DATA_DIR / "vpngate-socks5.log"
 OPENVPN_LOG = DATA_DIR / "openvpn.log"
-DANTED_LOG = DATA_DIR / "danted.log"
+SOCKS_LOG = DATA_DIR / "socks5.log"
 LOCK_FILE = RUN_DIR / "lock"
 OPENVPN_PID = RUN_DIR / "openvpn.pid"
-DANTED_PID = RUN_DIR / "danted.pid"
-DANTED_CONF = RUN_DIR / "danted.conf"
+SOCKS_PID = RUN_DIR / "socks5.pid"
 RUNTIME_OVPN = RUN_DIR / "current.runtime.ovpn"
+SO_BINDTODEVICE = 25
 
 
 @dataclass
@@ -375,7 +376,7 @@ def stop_pid(pid_file: Path, name: str, timeout: int = 10) -> None:
 
 
 def stop_services() -> None:
-    stop_pid(DANTED_PID, "danted")
+    stop_pid(SOCKS_PID, "socks-server")
     stop_pid(OPENVPN_PID, "openvpn")
 
 
@@ -430,30 +431,6 @@ def wait_for_tun(timeout: int) -> bool:
     return False
 
 
-def write_danted_conf(port: int) -> None:
-    DANTED_CONF.write_text(f"""logoutput: {DANTED_LOG}
-internal: 0.0.0.0 port = {port}
-external: tun0
-clientmethod: none
-socksmethod: none
-user.privileged: root
-user.notprivileged: nobody
-user.libwrap: nobody
-pidfile: {DANTED_PID}
-
-client pass {{
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    log: error
-}}
-
-socks pass {{
-    from: 0.0.0.0/0 to: 0.0.0.0/0
-    command: bind connect udpassociate
-    log: error
-}}
-""", encoding="utf-8")
-
-
 def start_openvpn(ovpn_path: Path, meta: dict) -> None:
     timeout = env_int("CONNECT_TIMEOUT", 60)
     remote_ip = configure_kill_switch(meta["remote_host"], int(meta["remote_port"]), meta["proto"])
@@ -473,18 +450,25 @@ def start_openvpn(ovpn_path: Path, meta: dict) -> None:
     log("OpenVPN connected and tun0 is available")
 
 
-def start_danted() -> None:
+def start_socks_server() -> None:
     port = env_int("SOCKS_PORT", 1080)
-    write_danted_conf(port)
-    DANTED_PID.unlink(missing_ok=True)
-    run_cmd(["danted", "-f", str(DANTED_CONF), "-D"])
+    SOCKS_PID.unlink(missing_ok=True)
+    SOCKS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = SOCKS_LOG.open("ab")
+    proc = subprocess.Popen(
+        ["python3", sys.argv[0], "socks-server"],
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        close_fds=True,
+    )
+    SOCKS_PID.write_text(str(proc.pid), encoding="utf-8")
     end = time.time() + 10
     while time.time() < end:
-        if pid_alive(DANTED_PID):
-            log(f"danted is listening on 0.0.0.0:{port}")
+        if pid_alive(SOCKS_PID):
+            log(f"socks-server is listening on 0.0.0.0:{port}")
             return
         time.sleep(0.5)
-    raise RuntimeError("danted did not start")
+    raise RuntimeError("socks-server did not start")
 
 
 def curl_through_socks() -> str:
@@ -507,7 +491,7 @@ def start_current(verify: bool = True) -> None:
         raise RuntimeError("current node is not configured")
     stop_services()
     start_openvpn(CURRENT_OVPN, meta)
-    start_danted()
+    start_socks_server()
     if verify:
         ip = curl_through_socks()
         log(f"SOCKS5 health check OK, exit_ip={ip}")
@@ -565,8 +549,8 @@ def cmd_run(_: argparse.Namespace) -> None:
         time.sleep(30)
         if not pid_alive(OPENVPN_PID):
             die("openvpn process exited")
-        if not pid_alive(DANTED_PID):
-            die("danted process exited")
+        if not pid_alive(SOCKS_PID):
+            die("socks-server process exited")
 
 
 def print_candidates(candidates: list[Candidate], limit: int) -> None:
@@ -592,7 +576,7 @@ def cmd_status(_: argparse.Namespace) -> None:
         die("no current node configured", code=2)
     print(json.dumps(meta, indent=2, sort_keys=True))
     print(f"openvpn_alive={pid_alive(OPENVPN_PID)}")
-    print(f"danted_alive={pid_alive(DANTED_PID)}")
+    print(f"socks_server_alive={pid_alive(SOCKS_PID)}")
     try:
         print(f"exit_ip={curl_through_socks()}")
     except Exception as exc:
@@ -650,13 +634,141 @@ def cmd_auto(args: argparse.Namespace) -> None:
 def cmd_health(_: argparse.Namespace) -> None:
     if not pid_alive(OPENVPN_PID):
         die("openvpn is not running", code=1)
-    if not pid_alive(DANTED_PID):
-        die("danted is not running", code=1)
+    if not pid_alive(SOCKS_PID):
+        die("socks-server is not running", code=1)
     try:
         ip = curl_through_socks()
         print(ip)
     except Exception as exc:
         die(f"health check failed: {exc}", code=1)
+
+
+def recv_exact(conn: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            raise ConnectionError("connection closed")
+        data += chunk
+    return data
+
+
+def socks_reply(conn: socket.socket, code: int) -> None:
+    conn.sendall(b"\x05" + bytes([code]) + b"\x00\x01\x00\x00\x00\x00\x00\x00")
+
+
+def connect_via_tun(host: str, port: int) -> socket.socket:
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    last_error: Exception | None = None
+    for family, socktype, proto, _, sockaddr in infos:
+        remote = socket.socket(family, socktype, proto)
+        try:
+            remote.settimeout(30)
+            remote.setsockopt(socket.SOL_SOCKET, SO_BINDTODEVICE, b"tun0\0")
+            remote.connect(sockaddr)
+            remote.settimeout(None)
+            return remote
+        except Exception as exc:
+            last_error = exc
+            remote.close()
+    raise ConnectionError(f"failed to connect via tun0 to {host}:{port}: {last_error}")
+
+
+def relay_tcp(left: socket.socket, right: socket.socket) -> None:
+    import select
+
+    sockets = [left, right]
+    try:
+        while True:
+            readable, _, _ = select.select(sockets, [], [], 300)
+            if not readable:
+                return
+            for src in readable:
+                dst = right if src is left else left
+                data = src.recv(65536)
+                if not data:
+                    return
+                dst.sendall(data)
+    finally:
+        for item in sockets:
+            try:
+                item.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            item.close()
+
+
+def handle_socks_client(conn: socket.socket, peer: tuple) -> None:
+    with conn:
+        try:
+            conn.settimeout(30)
+            header = recv_exact(conn, 2)
+            if header[0] != 5:
+                return
+            methods = recv_exact(conn, header[1])
+            if 0 not in methods:
+                conn.sendall(b"\x05\xff")
+                return
+            conn.sendall(b"\x05\x00")
+
+            req = recv_exact(conn, 4)
+            version, command, _, atyp = req
+            if version != 5:
+                return
+            if command != 1:
+                socks_reply(conn, 7)
+                return
+
+            if atyp == 1:
+                host = socket.inet_ntop(socket.AF_INET, recv_exact(conn, 4))
+            elif atyp == 3:
+                host_len = recv_exact(conn, 1)[0]
+                host = recv_exact(conn, host_len).decode("idna")
+            elif atyp == 4:
+                host = socket.inet_ntop(socket.AF_INET6, recv_exact(conn, 16))
+            else:
+                socks_reply(conn, 8)
+                return
+            port = int.from_bytes(recv_exact(conn, 2), "big")
+
+            remote = connect_via_tun(host, port)
+            socks_reply(conn, 0)
+            conn.settimeout(None)
+            relay_tcp(conn, remote)
+        except Exception as exc:
+            try:
+                socks_reply(conn, 1)
+            except Exception:
+                pass
+            print(f"socks client {peer} failed: {exc}", flush=True)
+
+
+def cmd_socks_server(_: argparse.Namespace) -> None:
+    ensure_dirs()
+    port = env_int("SOCKS_PORT", 1080)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", port))
+    server.listen(256)
+    print(f"socks-server listening on 0.0.0.0:{port}, outbound=tun0", flush=True)
+
+    def shutdown(signum, frame):
+        print(f"socks-server received signal {signum}", flush=True)
+        try:
+            server.close()
+        finally:
+            raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    while True:
+        try:
+            conn, peer = server.accept()
+        except OSError:
+            return
+        thread = threading.Thread(target=handle_socks_client, args=(conn, peer), daemon=True)
+        thread.start()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -665,7 +777,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("run", help="start and monitor the VPNGate SOCKS5 service").set_defaults(func=cmd_run)
     sub.add_parser("status", help="show current node and process status").set_defaults(func=cmd_status)
-    sub.add_parser("health", help="check OpenVPN, danted, and SOCKS5 exit").set_defaults(func=cmd_health)
+    sub.add_parser("health", help="check OpenVPN, SOCKS5 server, and SOCKS5 exit").set_defaults(func=cmd_health)
+    sub.add_parser("socks-server", help=argparse.SUPPRESS).set_defaults(func=cmd_socks_server)
 
     list_p = sub.add_parser("list", help="list VPNGate candidates")
     list_p.add_argument("--country", default="", help="CountryShort filter, for example JP, US, KR")
