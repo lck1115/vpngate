@@ -34,6 +34,7 @@ CACHE_FILE = DATA_DIR / "vpngate-cache.csv"
 LOG_FILE = DATA_DIR / "vpngate-socks5.log"
 OPENVPN_LOG = DATA_DIR / "openvpn.log"
 SOCKS_LOG = DATA_DIR / "socks5.log"
+FAILED_NODES_FILE = DATA_DIR / "failed-nodes.json"
 LOCK_FILE = RUN_DIR / "lock"
 OPENVPN_PID = RUN_DIR / "openvpn.pid"
 SOCKS_PID = RUN_DIR / "socks5.pid"
@@ -140,14 +141,33 @@ def run_cmd(args: list[str], check: bool = True, capture: bool = False, timeout:
     return subprocess.run(args, check=check, text=True, capture_output=capture, timeout=timeout)
 
 
+def api_urls() -> list[str]:
+    raw = os.getenv("VPNGATE_API_URLS", API_URL)
+    urls = [item.strip() for item in raw.split(",") if item.strip()]
+    return urls or [API_URL]
+
+
 def fetch_api() -> str:
-    timeout = env_int("CONNECT_TIMEOUT", 60)
-    log(f"Fetching VPNGate API: {API_URL}")
-    req = urllib.request.Request(API_URL, headers={"User-Agent": "vpngate-socks5/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
-    CACHE_FILE.write_text(body, encoding="utf-8")
-    return body
+    timeout = env_int("API_TIMEOUT", 20)
+    errors = []
+    for url in api_urls():
+        try:
+            log(f"Fetching VPNGate API: {url}")
+            req = urllib.request.Request(url, headers={"User-Agent": "vpngate-socks5/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+            if "#HostName," not in body:
+                raise RuntimeError("response does not look like VPNGate CSV")
+            CACHE_FILE.write_text(body, encoding="utf-8")
+            return body
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+            log(f"VPNGate API endpoint failed: {url}: {exc}")
+
+    if env_bool("USE_CACHE_ON_API_FAILURE", True) and CACHE_FILE.exists():
+        log("All VPNGate API endpoints failed; using cached VPNGate CSV")
+        return CACHE_FILE.read_text(encoding="utf-8")
+    raise RuntimeError("all VPNGate API endpoints failed: " + " | ".join(errors))
 
 
 def parse_int(value: str, default: int = 0) -> int:
@@ -216,7 +236,46 @@ def csv_rows(text: str) -> Iterable[dict[str, str]]:
     return csv.DictReader(csv_lines)
 
 
-def load_candidates(country: str = "", use_cache: bool = False, protocol_policy: str | None = None) -> list[Candidate]:
+def candidate_from_row(row: dict[str, str]) -> Candidate | None:
+    ovpn_b64 = (row.get("OpenVPN_ConfigData_Base64") or "").strip()
+    if not ovpn_b64:
+        return None
+    ovpn = decode_ovpn(ovpn_b64)
+    if not ovpn:
+        return None
+    remote = parse_remote(ovpn)
+    if not remote:
+        return None
+    remote_host, remote_port, proto = remote
+
+    return Candidate(
+        hostname=row.get("HostName", ""),
+        ip=row.get("IP", ""),
+        score_raw=parse_int(row.get("Score", "0")),
+        ping=parse_int(row.get("Ping", "0")),
+        speed=parse_int(row.get("Speed", "0")),
+        country_long=row.get("CountryLong", ""),
+        country_short=(row.get("CountryShort", "") or "").upper(),
+        sessions=parse_int(row.get("NumVpnSessions", "0")),
+        uptime=parse_int(row.get("Uptime", "0")),
+        total_users=parse_int(row.get("TotalUsers", "0")),
+        total_traffic=parse_int(row.get("TotalTraffic", "0")),
+        log_type=row.get("LogType", ""),
+        operator=row.get("Operator", ""),
+        message=row.get("Message", ""),
+        ovpn_b64=ovpn_b64,
+        proto=proto,
+        remote_host=remote_host,
+        remote_port=remote_port,
+    )
+
+
+def load_candidates(
+    country: str = "",
+    use_cache: bool = False,
+    protocol_policy: str | None = None,
+    include_failed: bool = False,
+) -> list[Candidate]:
     text = CACHE_FILE.read_text(encoding="utf-8") if use_cache and CACHE_FILE.exists() else fetch_api()
     country = country.strip().upper()
     min_speed = env_int("MIN_SPEED", 0)
@@ -227,59 +286,23 @@ def load_candidates(country: str = "", use_cache: bool = False, protocol_policy:
     for row in csv_rows(text):
         if country and (row.get("CountryShort") or "").upper() != country:
             continue
-
-        ovpn_b64 = (row.get("OpenVPN_ConfigData_Base64") or "").strip()
-        if not ovpn_b64:
+        candidate = candidate_from_row(row)
+        if not candidate:
             continue
-        ovpn = decode_ovpn(ovpn_b64)
-        if not ovpn:
+        if candidate.ping <= 0 and candidate.speed <= 0:
             continue
-        remote = parse_remote(ovpn)
-        if not remote:
+        if candidate.speed < min_speed:
             continue
-        remote_host, remote_port, proto = remote
-
-        ping = parse_int(row.get("Ping", "0"))
-        speed = parse_int(row.get("Speed", "0"))
-        sessions = parse_int(row.get("NumVpnSessions", "0"))
-        uptime = parse_int(row.get("Uptime", "0"))
-
-        if ping <= 0 and speed <= 0:
-            continue
-        if speed < min_speed:
-            continue
-        if ping > max_ping:
+        if candidate.ping > max_ping:
             continue
 
-        candidates.append(Candidate(
-            hostname=row.get("HostName", ""),
-            ip=row.get("IP", ""),
-            score_raw=parse_int(row.get("Score", "0")),
-            ping=ping,
-            speed=speed,
-            country_long=row.get("CountryLong", ""),
-            country_short=(row.get("CountryShort", "") or "").upper(),
-            sessions=sessions,
-            uptime=uptime,
-            total_users=parse_int(row.get("TotalUsers", "0")),
-            total_traffic=parse_int(row.get("TotalTraffic", "0")),
-            log_type=row.get("LogType", ""),
-            operator=row.get("Operator", ""),
-            message=row.get("Message", ""),
-            ovpn_b64=ovpn_b64,
-            proto=proto,
-            remote_host=remote_host,
-            remote_port=remote_port,
-        ))
+        candidates.append(candidate)
 
-    if protocol_policy == "tcp_only":
-        candidates = [c for c in candidates if c.proto == "tcp"]
-    elif protocol_policy == "udp_only":
-        candidates = [c for c in candidates if c.proto == "udp"]
-    elif protocol_policy == "prefer_tcp":
-        tcp_candidates = [c for c in candidates if c.proto == "tcp"]
-        if tcp_candidates:
-            candidates = tcp_candidates
+    candidates = apply_protocol_policy(candidates, protocol_policy)
+
+    if not include_failed:
+        failed_nodes = load_failed_nodes()
+        candidates = [c for c in candidates if not is_failed_candidate(c, failed_nodes)]
 
     score_candidates(candidates)
     return sorted(candidates, key=lambda c: c.score, reverse=True)
@@ -309,6 +332,18 @@ def score_candidates(candidates: list[Candidate]) -> None:
             0.20 * normalize(c.sessions, sessions, inverse=True) +
             0.10 * normalize(c.uptime, uptimes)
         ), 2)
+
+
+def apply_protocol_policy(candidates: list[Candidate], protocol_policy: str) -> list[Candidate]:
+    if protocol_policy == "tcp_only":
+        return [c for c in candidates if c.proto == "tcp"]
+    if protocol_policy == "udp_only":
+        return [c for c in candidates if c.proto == "udp"]
+    if protocol_policy == "prefer_tcp":
+        tcp_candidates = [c for c in candidates if c.proto == "tcp"]
+        if tcp_candidates:
+            return tcp_candidates
+    return candidates
 
 
 def candidate_to_json(candidate: Candidate) -> dict:
@@ -356,6 +391,73 @@ def read_json(path: Path) -> dict | None:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def candidate_key(candidate: Candidate | dict) -> str:
+    if isinstance(candidate, Candidate):
+        proto = candidate.proto
+        host = candidate.remote_host
+        port = candidate.remote_port
+    else:
+        proto = candidate.get("proto", "")
+        host = candidate.get("remote_host", "")
+        port = candidate.get("remote_port", "")
+    return f"{proto}:{host}:{port}"
+
+
+def load_failed_nodes() -> dict:
+    if not FAILED_NODES_FILE.exists():
+        return {}
+    try:
+        data = json.loads(FAILED_NODES_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    now = time.time()
+    changed = False
+    for key in list(data.keys()):
+        if float(data[key].get("until", 0)) <= now:
+            data.pop(key, None)
+            changed = True
+    if changed:
+        save_failed_nodes(data)
+    return data
+
+
+def save_failed_nodes(data: dict) -> None:
+    FAILED_NODES_FILE.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def is_failed_candidate(candidate: Candidate, failed_nodes: dict | None = None) -> bool:
+    failed_nodes = failed_nodes if failed_nodes is not None else load_failed_nodes()
+    item = failed_nodes.get(candidate_key(candidate))
+    return bool(item and float(item.get("until", 0)) > time.time())
+
+
+def record_failure(candidate: Candidate, reason: str) -> None:
+    ttl = env_int("FAILED_NODE_TTL_SECONDS", 1800)
+    if ttl <= 0:
+        return
+    failed_nodes = load_failed_nodes()
+    key = candidate_key(candidate)
+    failed_nodes[key] = {
+        "country_short": candidate.country_short,
+        "ip": candidate.ip,
+        "proto": candidate.proto,
+        "remote_host": candidate.remote_host,
+        "remote_port": candidate.remote_port,
+        "failed_at": int(time.time()),
+        "until": int(time.time() + ttl),
+        "reason": reason[-1000:],
+    }
+    save_failed_nodes(failed_nodes)
+
+
+def clear_failure(candidate: Candidate) -> None:
+    failed_nodes = load_failed_nodes()
+    key = candidate_key(candidate)
+    if key in failed_nodes:
+        failed_nodes.pop(key, None)
+        save_failed_nodes(failed_nodes)
 
 
 def pid_alive(pid_file: Path) -> bool:
@@ -566,10 +668,12 @@ def install_best_available(country: str = "", protocol_policy: str | None = None
                 f"proto={candidate.proto} remote={candidate.remote_host}:{candidate.remote_port}"
             )
             install_candidate(candidate, verify=True)
+            clear_failure(candidate)
             return candidate
         except Exception as exc:
             last_error = exc
             log(f"Candidate {candidate.country_short} {candidate.ip} failed: {exc}")
+            record_failure(candidate, str(exc))
             stop_services()
             reset_firewall_open()
 
@@ -635,8 +739,66 @@ def print_candidates(candidates: list[Candidate], limit: int) -> None:
         )
 
 
+def cmd_diagnose(args: argparse.Namespace) -> None:
+    country = (args.country or "").strip().upper()
+    protocol_policy = normalize_protocol_policy(args.protocol)
+    min_speed = env_int("MIN_SPEED", 0)
+    max_ping = env_int("MAX_PING", 9999)
+    text = fetch_api()
+    rows = list(csv_rows(text))
+    country_rows = [r for r in rows if not country or (r.get("CountryShort") or "").upper() == country]
+
+    with_ovpn = [r for r in country_rows if (r.get("OpenVPN_ConfigData_Base64") or "").strip()]
+    parsed_candidates: list[Candidate] = []
+    decode_or_remote_failed = 0
+    for row in with_ovpn:
+        candidate = candidate_from_row(row)
+        if candidate:
+            parsed_candidates.append(candidate)
+        else:
+            decode_or_remote_failed += 1
+
+    tcp_count = len([c for c in parsed_candidates if c.proto == "tcp"])
+    udp_count = len([c for c in parsed_candidates if c.proto == "udp"])
+    after_basic = [
+        c for c in parsed_candidates
+        if not (c.ping <= 0 and c.speed <= 0)
+        and c.speed >= min_speed
+        and c.ping <= max_ping
+    ]
+    after_protocol = apply_protocol_policy(after_basic, protocol_policy)
+    failed_nodes = load_failed_nodes()
+    failed_suppressed = [c for c in after_protocol if is_failed_candidate(c, failed_nodes)]
+    final_candidates = [c for c in after_protocol if not is_failed_candidate(c, failed_nodes)]
+    score_candidates(final_candidates)
+    final_candidates = sorted(final_candidates, key=lambda c: c.score, reverse=True)
+
+    print(f"country={country or 'ANY'}")
+    print(f"protocol_policy={protocol_policy}")
+    print(f"api_urls={','.join(api_urls())}")
+    print(f"raw_rows={len(rows)}")
+    print(f"country_rows={len(country_rows)}")
+    print(f"with_openvpn_config={len(with_ovpn)}")
+    print(f"decode_or_remote_failed={decode_or_remote_failed}")
+    print(f"parsed_openvpn_candidates={len(parsed_candidates)}")
+    print(f"tcp_candidates={tcp_count}")
+    print(f"udp_candidates={udp_count}")
+    print(f"after_speed_ping_filters={len(after_basic)}")
+    print(f"after_protocol_policy={len(after_protocol)}")
+    print(f"failed_ttl_suppressed={len(failed_suppressed)}")
+    print(f"final_candidates={len(final_candidates)}")
+
+    if failed_suppressed:
+        print("\nSuppressed by failed-node TTL:")
+        print_candidates(sorted(failed_suppressed, key=lambda c: candidate_key(c))[:args.limit], args.limit)
+
+    if final_candidates:
+        print("\nTop final candidates:")
+        print_candidates(final_candidates, args.limit)
+
+
 def cmd_list(args: argparse.Namespace) -> None:
-    candidates = load_candidates(country=args.country or "", protocol_policy=args.protocol)
+    candidates = load_candidates(country=args.country or "", protocol_policy=args.protocol, include_failed=args.include_failed)
     if not candidates:
         die(f"no candidates found for country={args.country or 'ANY'}")
     print_candidates(candidates, args.limit)
@@ -673,8 +835,10 @@ def switch_to_candidate(candidate: Candidate) -> None:
         reset_firewall_open()
         try:
             install_candidate(candidate, verify=True)
+            clear_failure(candidate)
         except Exception as exc:
             log(f"Switch failed: {exc}")
+            record_failure(candidate, str(exc))
             reset_firewall_open()
             if env_bool("SWITCH_ROLLBACK", True):
                 try:
@@ -851,13 +1015,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("run", help="start and monitor the VPNGate SOCKS5 service").set_defaults(func=cmd_run)
     sub.add_parser("status", help="show current node and process status").set_defaults(func=cmd_status)
     sub.add_parser("health", help="check OpenVPN, SOCKS5 server, and SOCKS5 exit").set_defaults(func=cmd_health)
-    sub.add_parser("socks-server", help=argparse.SUPPRESS).set_defaults(func=cmd_socks_server)
-
     list_p = sub.add_parser("list", help="list VPNGate candidates")
     list_p.add_argument("--country", default="", help="CountryShort filter, for example JP, US, KR")
     list_p.add_argument("--limit", type=int, default=env_int("LIST_LIMIT", 10))
     list_p.add_argument("--protocol", default=None, choices=["prefer_tcp", "tcp_only", "udp_only", "any"], help="Protocol policy override")
+    list_p.add_argument("--include-failed", action="store_true", help="Include nodes currently suppressed by failed-node TTL")
     list_p.set_defaults(func=cmd_list)
+
+    diagnose_p = sub.add_parser("diagnose", help="explain candidate counts after each filter")
+    diagnose_p.add_argument("--country", default="", help="CountryShort filter, for example TW, JP, US")
+    diagnose_p.add_argument("--protocol", default=None, choices=["prefer_tcp", "tcp_only", "udp_only", "any"], help="Protocol policy override")
+    diagnose_p.add_argument("--limit", type=int, default=env_int("LIST_LIMIT", 10))
+    diagnose_p.set_defaults(func=cmd_diagnose)
 
     switch_p = sub.add_parser("switch", help="interactively switch to a VPNGate node")
     switch_p.add_argument("--country", default="", help="CountryShort filter, for example JP, US, KR")
@@ -874,9 +1043,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    ensure_dirs()
+    if len(sys.argv) > 1 and sys.argv[1] == "socks-server":
+        ensure_dirs()
+        cmd_socks_server(argparse.Namespace())
+        return
     parser = build_parser()
     args = parser.parse_args()
+    ensure_dirs()
     try:
         args.func(args)
     except KeyboardInterrupt:

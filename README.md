@@ -26,6 +26,8 @@ VPNGate API
 - 首次启动自动选择综合最优 VPNGate 节点。
 - 可以按国家列出候选节点，例如 `JP` 前 10 个。
 - 可以交互式选择编号切换出口 IP。
+- 失败节点会进入 TTL 黑名单，默认 30 分钟内不再尝试。
+- 可以用 `diagnose` 查看某个国家的原始节点数、协议分布和过滤结果。
 - 切换失败会尝试回滚到上一个可用节点。
 - SOCKS5 只绑定宿主机 `127.0.0.1`，不暴露公网。
 - OpenVPN 断开时，SOCKS5 请求应失败，而不是回落到 VPS 原始公网 IP。
@@ -81,6 +83,12 @@ TCP/UDP 都列出来：
 
 ```bash
 docker exec -it vpngate-socks5 vpngate list --country JP --limit 10 --protocol any
+```
+
+包含当前失败 TTL 黑名单中的节点：
+
+```bash
+docker exec -it vpngate-socks5 vpngate list --country JP --limit 10 --include-failed
 ```
 
 输出示例：
@@ -142,6 +150,42 @@ docker exec -it vpngate-socks5 vpngate auto --country JP
 docker exec -it vpngate-socks5 vpngate auto --country JP --protocol tcp_only
 ```
 
+## 诊断指定国家
+
+查看某个国家为什么候选节点少，或为什么被过滤掉：
+
+```bash
+docker exec -it vpngate-socks5 vpngate diagnose --country TW
+```
+
+TCP/UDP 全部纳入诊断：
+
+```bash
+docker exec -it vpngate-socks5 vpngate diagnose --country TW --protocol any
+```
+
+只看 TCP 策略下的过滤结果：
+
+```bash
+docker exec -it vpngate-socks5 vpngate diagnose --country TW --protocol tcp_only
+```
+
+诊断输出包含：
+
+```text
+raw_rows
+country_rows
+with_openvpn_config
+decode_or_remote_failed
+parsed_openvpn_candidates
+tcp_candidates
+udp_candidates
+after_speed_ping_filters
+after_protocol_policy
+failed_ttl_suppressed
+final_candidates
+```
+
 ## 环境变量
 
 在 `docker-compose.yml` 中调整：
@@ -155,6 +199,10 @@ environment:
   MAX_PING: "9999"
   PROTOCOL_POLICY: "prefer_tcp"
   PREFER_TCP: "true"
+  FAILED_NODE_TTL_SECONDS: "1800"
+  VPNGATE_API_URLS: "https://www.vpngate.net/api/iphone/,https://api.vpngate.net/api/iphone/"
+  API_TIMEOUT: "20"
+  USE_CACHE_ON_API_FAILURE: "true"
   HEALTHCHECK_URL: "https://api.ipify.org"
   CONNECT_TIMEOUT: "10"
   SWITCH_ROLLBACK: "true"
@@ -169,6 +217,10 @@ environment:
 - `MAX_PING`：过滤高于该 ms 延迟的节点。
 - `PROTOCOL_POLICY`：协议策略，支持 `prefer_tcp`、`tcp_only`、`udp_only`、`any`。
 - `PREFER_TCP`：旧兼容项；未设置 `PROTOCOL_POLICY` 时，`true` 等同于 `prefer_tcp`，`false` 等同于 `any`。
+- `FAILED_NODE_TTL_SECONDS`：失败节点黑名单 TTL，默认 `1800` 秒；设为 `0` 可关闭。
+- `VPNGATE_API_URLS`：VPNGate API endpoint 列表，逗号分隔，按顺序重试。
+- `API_TIMEOUT`：单个 VPNGate API endpoint 请求超时秒数。
+- `USE_CACHE_ON_API_FAILURE`：全部 API endpoint 失败时是否使用上次缓存的 CSV。
 - `HEALTHCHECK_URL`：用于验证 SOCKS5 出口的 URL。
 - `CONNECT_TIMEOUT`：等待 OpenVPN/tun0 的秒数，默认 `10`，用于快速跳过不可用 VPNGate 节点。
 - `SWITCH_ROLLBACK`：切换失败时是否回滚到上一个节点。
@@ -235,6 +287,7 @@ data/current.json
 data/current.ovpn
 data/previous.json
 data/previous.ovpn
+data/failed-nodes.json
 data/vpngate-cache.csv
 data/vpngate-socks5.log
 data/openvpn.log
