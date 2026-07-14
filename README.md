@@ -33,19 +33,14 @@ VPNGate API
 ## 启动
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
-如果使用 GitHub Actions 构建镜像，推送到 GitHub 后镜像会发布到：
+默认使用 GitHub Actions 构建好的镜像：
 
 ```text
-ghcr.io/<owner>/<repo>:latest
-```
-
-之后可以把 `docker-compose.yml` 里的 `build: .` 改为：
-
-```yaml
-image: ghcr.io/<owner>/<repo>:latest
+ghcr.io/lck1115/vpngate:latest
 ```
 
 查看日志：
@@ -76,6 +71,18 @@ curl --socks5-hostname 127.0.0.1:1080 https://api.ipify.org
 docker exec -it vpngate-socks5 vpngate list --country JP --limit 10
 ```
 
+只看 TCP 节点：
+
+```bash
+docker exec -it vpngate-socks5 vpngate list --country JP --limit 10 --protocol tcp_only
+```
+
+TCP/UDP 都列出来：
+
+```bash
+docker exec -it vpngate-socks5 vpngate list --country JP --limit 10 --protocol any
+```
+
 输出示例：
 
 ```text
@@ -94,6 +101,12 @@ JP, US, KR, TW, SG, HK
 
 ```bash
 docker exec -it vpngate-socks5 vpngate switch --country JP
+```
+
+如果只想从 TCP 节点中选择：
+
+```bash
+docker exec -it vpngate-socks5 vpngate switch --country JP --protocol tcp_only
 ```
 
 命令会展示候选节点，输入编号后自动切换：
@@ -123,6 +136,12 @@ docker exec -it vpngate-socks5 vpngate auto
 docker exec -it vpngate-socks5 vpngate auto --country JP
 ```
 
+指定国家并只尝试 TCP：
+
+```bash
+docker exec -it vpngate-socks5 vpngate auto --country JP --protocol tcp_only
+```
+
 ## 环境变量
 
 在 `docker-compose.yml` 中调整：
@@ -134,6 +153,7 @@ environment:
   LIST_LIMIT: "10"
   MIN_SPEED: "0"
   MAX_PING: "9999"
+  PROTOCOL_POLICY: "prefer_tcp"
   PREFER_TCP: "true"
   HEALTHCHECK_URL: "https://api.ipify.org"
   CONNECT_TIMEOUT: "10"
@@ -147,10 +167,18 @@ environment:
 - `LIST_LIMIT`：列表默认展示数量。
 - `MIN_SPEED`：过滤低于该 bps 速度的节点。
 - `MAX_PING`：过滤高于该 ms 延迟的节点。
-- `PREFER_TCP`：优先选择 OpenVPN TCP 节点；如果没有 TCP 候选，会回退到全部候选。
+- `PROTOCOL_POLICY`：协议策略，支持 `prefer_tcp`、`tcp_only`、`udp_only`、`any`。
+- `PREFER_TCP`：旧兼容项；未设置 `PROTOCOL_POLICY` 时，`true` 等同于 `prefer_tcp`，`false` 等同于 `any`。
 - `HEALTHCHECK_URL`：用于验证 SOCKS5 出口的 URL。
 - `CONNECT_TIMEOUT`：等待 OpenVPN/tun0 的秒数，默认 `10`，用于快速跳过不可用 VPNGate 节点。
 - `SWITCH_ROLLBACK`：切换失败时是否回滚到上一个节点。
+
+协议策略说明：
+
+- `prefer_tcp`：默认策略；有 TCP 候选时只选 TCP，没有 TCP 时回退到 TCP/UDP 全部候选。
+- `tcp_only`：只选 TCP；适合 UDP 在 VPS 机房不可用或不稳定的场景。
+- `udp_only`：只选 UDP；用于排查或特殊网络。
+- `any`：TCP/UDP 都参与排序；适合某些国家 TCP 节点很少时扩大候选范围。
 
 ## 评分规则
 

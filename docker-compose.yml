@@ -1,6 +1,6 @@
 services:
   vpngate-socks5:
-    build: .
+    image: ghcr.io/lck1115/vpngate:latest
     container_name: vpngate-socks5
     cap_add:
       - NET_ADMIN
@@ -14,6 +14,7 @@ services:
       LIST_LIMIT: "10"
       MIN_SPEED: "0"
       MAX_PING: "9999"
+      PROTOCOL_POLICY: "prefer_tcp"
       PREFER_TCP: "true"
       HEALTHCHECK_URL: "https://api.ipify.org"
       CONNECT_TIMEOUT: "10"

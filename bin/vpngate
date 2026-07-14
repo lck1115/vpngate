@@ -86,6 +86,24 @@ def env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def normalize_protocol_policy(value: str | None = None) -> str:
+    raw = value or os.getenv("PROTOCOL_POLICY")
+    if raw is None or raw.strip() == "":
+        policy = "prefer_tcp" if env_bool("PREFER_TCP", True) else "any"
+    else:
+        policy = raw.strip().lower().replace("-", "_")
+    aliases = {
+        "prefer": "prefer_tcp",
+        "tcp": "tcp_only",
+        "udp": "udp_only",
+        "all": "any",
+    }
+    policy = aliases.get(policy, policy)
+    if policy not in {"prefer_tcp", "tcp_only", "udp_only", "any"}:
+        raise ValueError("protocol policy must be one of: prefer_tcp, tcp_only, udp_only, any")
+    return policy
+
+
 def log(message: str) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y-%m-%d %H:%M:%S%z")
@@ -198,11 +216,12 @@ def csv_rows(text: str) -> Iterable[dict[str, str]]:
     return csv.DictReader(csv_lines)
 
 
-def load_candidates(country: str = "", use_cache: bool = False) -> list[Candidate]:
+def load_candidates(country: str = "", use_cache: bool = False, protocol_policy: str | None = None) -> list[Candidate]:
     text = CACHE_FILE.read_text(encoding="utf-8") if use_cache and CACHE_FILE.exists() else fetch_api()
     country = country.strip().upper()
     min_speed = env_int("MIN_SPEED", 0)
     max_ping = env_int("MAX_PING", 9999)
+    protocol_policy = normalize_protocol_policy(protocol_policy)
 
     candidates: list[Candidate] = []
     for row in csv_rows(text):
@@ -253,7 +272,11 @@ def load_candidates(country: str = "", use_cache: bool = False) -> list[Candidat
             remote_port=remote_port,
         ))
 
-    if env_bool("PREFER_TCP", True):
+    if protocol_policy == "tcp_only":
+        candidates = [c for c in candidates if c.proto == "tcp"]
+    elif protocol_policy == "udp_only":
+        candidates = [c for c in candidates if c.proto == "udp"]
+    elif protocol_policy == "prefer_tcp":
         tcp_candidates = [c for c in candidates if c.proto == "tcp"]
         if tcp_candidates:
             candidates = tcp_candidates
@@ -521,16 +544,16 @@ def start_current(verify: bool = True) -> None:
         log(f"SOCKS5 health check OK, exit_ip={ip}")
 
 
-def select_best(country: str = "") -> Candidate:
-    candidates = load_candidates(country=country)
+def select_best(country: str = "", protocol_policy: str | None = None) -> Candidate:
+    candidates = load_candidates(country=country, protocol_policy=protocol_policy)
     if not candidates:
         raise RuntimeError(f"no usable VPNGate candidates found for country={country or 'ANY'}")
     return candidates[0]
 
 
-def install_best_available(country: str = "") -> Candidate:
+def install_best_available(country: str = "", protocol_policy: str | None = None) -> Candidate:
     limit = env_int("LIST_LIMIT", 10)
-    candidates = load_candidates(country=country)
+    candidates = load_candidates(country=country, protocol_policy=protocol_policy)
     if not candidates:
         raise RuntimeError(f"no usable VPNGate candidates found for country={country or 'ANY'}")
 
@@ -613,7 +636,7 @@ def print_candidates(candidates: list[Candidate], limit: int) -> None:
 
 
 def cmd_list(args: argparse.Namespace) -> None:
-    candidates = load_candidates(country=args.country or "")
+    candidates = load_candidates(country=args.country or "", protocol_policy=args.protocol)
     if not candidates:
         die(f"no candidates found for country={args.country or 'ANY'}")
     print_candidates(candidates, args.limit)
@@ -664,7 +687,7 @@ def switch_to_candidate(candidate: Candidate) -> None:
 
 def cmd_switch(args: argparse.Namespace) -> None:
     limit = args.limit
-    candidates = load_candidates(country=args.country or "")
+    candidates = load_candidates(country=args.country or "", protocol_policy=args.protocol)
     if not candidates:
         die(f"no candidates found for country={args.country or 'ANY'}")
     print(f"Top {min(limit, len(candidates))} {args.country or 'ANY'} nodes:")
@@ -677,7 +700,7 @@ def cmd_auto(args: argparse.Namespace) -> None:
     country = args.country or os.getenv("DEFAULT_COUNTRY", "").strip().upper()
     with FileLock():
         reset_firewall_open()
-        candidate = install_best_available(country)
+        candidate = install_best_available(country, protocol_policy=args.protocol)
     print(f"Auto selected {candidate.country_short} {candidate.ip} score={candidate.score}")
 
 
@@ -833,15 +856,18 @@ def build_parser() -> argparse.ArgumentParser:
     list_p = sub.add_parser("list", help="list VPNGate candidates")
     list_p.add_argument("--country", default="", help="CountryShort filter, for example JP, US, KR")
     list_p.add_argument("--limit", type=int, default=env_int("LIST_LIMIT", 10))
+    list_p.add_argument("--protocol", default=None, choices=["prefer_tcp", "tcp_only", "udp_only", "any"], help="Protocol policy override")
     list_p.set_defaults(func=cmd_list)
 
     switch_p = sub.add_parser("switch", help="interactively switch to a VPNGate node")
     switch_p.add_argument("--country", default="", help="CountryShort filter, for example JP, US, KR")
     switch_p.add_argument("--limit", type=int, default=env_int("LIST_LIMIT", 10))
+    switch_p.add_argument("--protocol", default=None, choices=["prefer_tcp", "tcp_only", "udp_only", "any"], help="Protocol policy override")
     switch_p.set_defaults(func=cmd_switch)
 
     auto_p = sub.add_parser("auto", help="switch to the current best VPNGate node")
     auto_p.add_argument("--country", default="", help="CountryShort filter, for example JP, US, KR")
+    auto_p.add_argument("--protocol", default=None, choices=["prefer_tcp", "tcp_only", "udp_only", "any"], help="Protocol policy override")
     auto_p.set_defaults(func=cmd_auto)
 
     return parser
