@@ -57,6 +57,24 @@ docker logs -f vpngate-socks5
 docker exec -it vpngate-socks5 vpngate status
 ```
 
+打开交互菜单：
+
+```bash
+docker exec -it vpngate-socks5 vpngate menu
+```
+
+菜单支持：
+
+```text
+1. Status
+2. List candidates
+3. Switch by country
+4. Auto select best
+5. Diagnose country
+6. Health check
+7. Exit
+```
+
 验证 SOCKS5 出口 IP：
 
 ```bash
@@ -107,6 +125,20 @@ JP, US, KR, TW, SG, HK
 
 ## 交互式切换 IP
 
+推荐使用菜单：
+
+```bash
+docker exec -it vpngate-socks5 vpngate menu
+```
+
+选择：
+
+```text
+3. Switch by country
+```
+
+也可以直接执行命令：
+
 ```bash
 docker exec -it vpngate-socks5 vpngate switch --country JP
 ```
@@ -122,6 +154,8 @@ docker exec -it vpngate-socks5 vpngate switch --country JP --protocol tcp_only
 ```text
 Select node number:
 ```
+
+如果切换失败，默认会回滚到本次 `switch` 执行前正在使用的节点，而不是随机重新选择其他 IP。
 
 切换完成后验证：
 
@@ -293,6 +327,13 @@ data/vpngate-socks5.log
 data/openvpn.log
 data/socks5.log
 ```
+
+容器 stop/start 行为：
+
+- `docker stop vpngate-socks5` 会断开当前 OpenVPN 连接。
+- 下次 `docker start vpngate-socks5` 或 `docker compose up -d` 时，如果 `data/current.json` 和 `data/current.ovpn` 存在，会优先使用上一次成功保存的 VPN 配置。
+- 只有这个旧节点启动或健康检查失败时，才会重新请求 VPNGate API 并选择新节点。
+- 如果想强制重新选择，可以启动后执行 `docker exec -it vpngate-socks5 vpngate auto`，或在菜单里选择 `Auto select best`。
 
 ## 注意事项
 

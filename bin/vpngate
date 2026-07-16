@@ -29,6 +29,8 @@ NEXT_JSON = DATA_DIR / "next.json"
 CURRENT_OVPN = DATA_DIR / "current.ovpn"
 PREVIOUS_OVPN = DATA_DIR / "previous.ovpn"
 NEXT_OVPN = DATA_DIR / "next.ovpn"
+SWITCH_BACKUP_JSON = RUN_DIR / "switch-backup.json"
+SWITCH_BACKUP_OVPN = RUN_DIR / "switch-backup.ovpn"
 AUTH_FILE = DATA_DIR / "auth.txt"
 CACHE_FILE = DATA_DIR / "vpngate-cache.csv"
 LOG_FILE = DATA_DIR / "vpngate-socks5.log"
@@ -702,6 +704,25 @@ def rollback() -> None:
     start_current(verify=True)
 
 
+def save_switch_backup() -> bool:
+    SWITCH_BACKUP_JSON.unlink(missing_ok=True)
+    SWITCH_BACKUP_OVPN.unlink(missing_ok=True)
+    if not CURRENT_JSON.exists() or not CURRENT_OVPN.exists():
+        return False
+    shutil.copy2(CURRENT_JSON, SWITCH_BACKUP_JSON)
+    shutil.copy2(CURRENT_OVPN, SWITCH_BACKUP_OVPN)
+    return True
+
+
+def rollback_switch_backup() -> None:
+    if not SWITCH_BACKUP_JSON.exists() or not SWITCH_BACKUP_OVPN.exists():
+        raise RuntimeError("no switch backup available for rollback")
+    log("Rolling back to node active before switch")
+    shutil.copy2(SWITCH_BACKUP_JSON, CURRENT_JSON)
+    shutil.copy2(SWITCH_BACKUP_OVPN, CURRENT_OVPN)
+    start_current(verify=True)
+
+
 def cmd_run(_: argparse.Namespace) -> None:
     ensure_dirs()
     with FileLock():
@@ -830,9 +851,97 @@ def choose_interactive(candidates: list[Candidate], limit: int) -> Candidate:
         print(f"Please enter a number between 1 and {min(limit, len(candidates))}.")
 
 
+def prompt_text(label: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    raw = input(f"{label}{suffix}: ").strip()
+    return raw if raw else default
+
+
+def prompt_int(label: str, default: int, minimum: int = 1, maximum: int = 1000) -> int:
+    while True:
+        raw = prompt_text(label, str(default))
+        if re.fullmatch(r"\d+", raw):
+            value = int(raw)
+            if minimum <= value <= maximum:
+                return value
+        print(f"Please enter a number between {minimum} and {maximum}.")
+
+
+def prompt_protocol(default: str | None = None) -> str:
+    current = normalize_protocol_policy(default)
+    options = ["prefer_tcp", "tcp_only", "udp_only", "any"]
+    print("Protocol policy:")
+    for i, option in enumerate(options, start=1):
+        marker = " (default)" if option == current else ""
+        print(f"  {i}. {option}{marker}")
+    while True:
+        raw = prompt_text("Select protocol policy number or name", current)
+        if raw in options:
+            return raw
+        if re.fullmatch(r"\d+", raw):
+            index = int(raw)
+            if 1 <= index <= len(options):
+                return options[index - 1]
+        print("Please select prefer_tcp, tcp_only, udp_only, any, or 1-4.")
+
+
+def menu_args(**kwargs) -> argparse.Namespace:
+    return argparse.Namespace(**kwargs)
+
+
+def cmd_menu(_: argparse.Namespace) -> None:
+    while True:
+        print("")
+        print("VPNGate SOCKS5 menu")
+        print("  1. Status")
+        print("  2. List candidates")
+        print("  3. Switch by country")
+        print("  4. Auto select best")
+        print("  5. Diagnose country")
+        print("  6. Health check")
+        print("  7. Exit")
+        choice = prompt_text("Select action", "1")
+
+        try:
+            if choice == "1":
+                cmd_status(menu_args())
+            elif choice == "2":
+                country = prompt_text("CountryShort, empty means ANY", "").upper()
+                limit = prompt_int("Limit", env_int("LIST_LIMIT", 10), 1, 100)
+                protocol = prompt_protocol()
+                include_failed = prompt_text("Include failed TTL nodes? y/N", "N").lower() in {"y", "yes"}
+                cmd_list(menu_args(country=country, limit=limit, protocol=protocol, include_failed=include_failed))
+            elif choice == "3":
+                country = prompt_text("CountryShort, empty means ANY", "").upper()
+                limit = prompt_int("Limit", env_int("LIST_LIMIT", 10), 1, 100)
+                protocol = prompt_protocol()
+                cmd_switch(menu_args(country=country, limit=limit, protocol=protocol))
+            elif choice == "4":
+                country = prompt_text("CountryShort, empty means DEFAULT/ANY", "").upper()
+                protocol = prompt_protocol()
+                cmd_auto(menu_args(country=country, protocol=protocol))
+            elif choice == "5":
+                country = prompt_text("CountryShort, empty means ANY", "").upper()
+                limit = prompt_int("Limit", env_int("LIST_LIMIT", 10), 1, 100)
+                protocol = prompt_protocol()
+                cmd_diagnose(menu_args(country=country, limit=limit, protocol=protocol))
+            elif choice == "6":
+                cmd_health(menu_args())
+            elif choice == "7":
+                return
+            else:
+                print("Please select 1-7.")
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                print(f"Command exited with code {exc.code}.")
+        except Exception as exc:
+            print(f"ERROR: {exc}")
+
+
 def switch_to_candidate(candidate: Candidate) -> None:
     with FileLock():
         reset_firewall_open()
+        has_switch_backup = save_switch_backup()
         try:
             install_candidate(candidate, verify=True)
             clear_failure(candidate)
@@ -842,7 +951,10 @@ def switch_to_candidate(candidate: Candidate) -> None:
             reset_firewall_open()
             if env_bool("SWITCH_ROLLBACK", True):
                 try:
-                    rollback()
+                    if has_switch_backup:
+                        rollback_switch_backup()
+                    else:
+                        rollback()
                     return
                 except Exception as rollback_exc:
                     log(f"Rollback failed: {rollback_exc}")
@@ -1013,6 +1125,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("run", help="start and monitor the VPNGate SOCKS5 service").set_defaults(func=cmd_run)
+    sub.add_parser("menu", help="open interactive management menu").set_defaults(func=cmd_menu)
     sub.add_parser("status", help="show current node and process status").set_defaults(func=cmd_status)
     sub.add_parser("health", help="check OpenVPN, SOCKS5 server, and SOCKS5 exit").set_defaults(func=cmd_health)
     list_p = sub.add_parser("list", help="list VPNGate candidates")
